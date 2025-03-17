@@ -1,0 +1,179 @@
+import datetime
+import time
+import random
+import pandas as pd
+import requests
+from bs4 import BeautifulSoup
+from fake_useragent import UserAgent
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+
+# 配置参数
+KEYWORDS = "就业"
+START_DATE = '2024-03-12'
+END_DATE = '2025-03-11'
+MAX_RETRIES = 3
+REQUEST_DELAY = (1, 3)
+PAGES_PER_DAY = 50
+COOKIE = (
+    "SCF=AlBbrrUBlzs4vqWWCn058-1ApzyOM_VL61fshQW-OC2KgiK4ytzDRIcBgZCcRMQtcO47WSugjvLLxFHHeNCZH_Q.; SUB=_2A25K1DONDeRhGeFG71oZ9CfLzzmIHXVpqMlFrDV8PUNbmtANLRD6kW9NeXEWVwjolUUqLsJVmF15xIfcI3ERDZVg; SUBP=0033WrSXqPxfM725Ws9jqgMF55529P9D9W5ZrTlVgWo7kkDbDEpiviD.5JpX5KzhUgL.FoMRShnRSh.NSh-2dJLoIEXLxK-LBKBLBK.LxK-LBK-LB.BLxKqL1K-LBKeLxKqLB-BLBK-LxK-L1K5LBKqt; ALF=02_1744294109; SINAGLOBAL=4875203920536.783.1741782603494; ULV=1741782603530:1:1:1:4875203920536.783.1741782603494:; PC_TOKEN=c8f505d20b")
+
+
+class WeiboScraper:
+    def __init__(self):
+        self.session = requests.Session()
+        self.ua = UserAgent()
+        self._init_session()
+
+    def _init_session(self):
+        retry = Retry(
+            total=MAX_RETRIES,
+            backoff_factor=0.3,
+            status_forcelist=(500, 502, 503, 504)
+        )
+        adapter = HTTPAdapter(max_retries=retry)
+        self.session.mount('http://', adapter)
+        self.session.mount('https://', adapter)
+
+    def _get_headers(self):
+        return {
+            'User-Agent': self.ua.random,
+            'Cookie': COOKIE,
+            'Referer': 'https://weibo.com/'
+        }
+
+    def _random_delay(self):
+        time.sleep(random.uniform(*REQUEST_DELAY))
+
+    def generate_dates(self):
+        start = datetime.datetime.strptime(START_DATE, "%Y-%m-%d")
+        end = datetime.datetime.strptime(END_DATE, "%Y-%m-%d")
+        return [start + datetime.timedelta(days=i) for i in range((end - start).days + 1)]
+
+    def parse_page(self, html, current_date):
+        soup = BeautifulSoup(html, 'lxml')
+
+        if soup.find('div', class_='card card-no-result'):
+            print("触发反爬限制或没有更多数据")
+            return None, True
+
+        cards = soup.find_all('div', class_='card-wrap')
+        if not cards:
+            print("未找到有效数据卡片")
+            return None, False
+
+        results = []
+        for card in cards:
+            try:
+                item = {
+                    'author': self._parse_author(card),
+                    'content': self._parse_content(card),
+                    'reposts': self._parse_interaction(card, -3),
+                    'comments': self._parse_interaction(card, -2),
+                    'likes': self._parse_likes(card),
+                    'time': current_date,
+                    'link': self._parse_link(card)
+                }
+                results.append(item)
+            except Exception as e:
+                print(f"解析失败: {str(e)}")
+                continue
+        return results, False
+
+    def _parse_author(self, card):
+        author_tag = card.find('a', {'class': 'name'})
+        return author_tag.text.strip() if author_tag else None
+
+    def _parse_content(self, card):
+        content_tag = card.find('p', class_='txt')
+        if not content_tag:
+            return None
+        if content_tag.find('a', string='展开全文'):
+            return content_tag.text.replace('展开全文', '').strip()
+        return content_tag.text.strip()
+
+    def _parse_interaction(self, card, index):
+        actions = card.find_all('a', class_='woo-box-flex')
+        if len(actions) >= abs(index):
+            text = actions[index].text.strip()
+            return self._convert_number(text)
+        return 0
+
+    def _parse_likes(self, card):
+        likes_tag = card.find('span', class_='woo-like-count')
+        return self._convert_number(likes_tag.text.strip()) if likes_tag else 0
+
+    def _parse_link(self, card):
+        from_tag = card.find('p', class_='from')
+        if not from_tag:
+            return None
+        time_tag = from_tag.find('a', recursive=False)
+        if time_tag and time_tag.has_attr('href'):
+            href = time_tag['href']
+            if not href.startswith('http'):
+                return f'https://weibo.com{href}'
+            return href
+        return None
+
+    def _convert_number(self, text):
+        if '万' in text:
+            return int(float(text.replace('万+', '').replace('万', '')) * 10000)
+        return int(text) if text.isdigit() else 0
+
+    def scrape(self):
+        all_data = []
+        dates = self.generate_dates()
+
+        for date in dates:
+            current_date = date.strftime('%Y-%m-%d')
+            print(f"\n开始爬取 {current_date} 的数据...")
+
+            for page in range(1, PAGES_PER_DAY + 1):
+                self._random_delay()
+                print(f"正在处理第 {page} 页...", end='\r')
+
+                try:
+                    url = f"https://s.weibo.com/weibo?q={KEYWORDS}&typeall=1&suball=1&timescope=custom:{current_date}-0:{current_date}-23&page={page}"
+                    response = self.session.get(url, headers=self._get_headers(), timeout=15)
+                    response.raise_for_status()
+
+                    data, blocked = self.parse_page(response.text, current_date)
+                    if blocked:
+                        break
+                    if data:
+                        all_data.extend(data)
+                        print(f"已采集 {len(all_data)} 条数据", end='\r')
+
+                except Exception as e:
+                    print(f"请求失败: {str(e)}")
+                    continue
+
+        self.save_data(all_data)
+
+    def save_data(self, data):
+        if not data:
+            print("没有需要保存的数据")
+            return
+
+        df = pd.DataFrame(data)
+        # 新增过滤逻辑
+        df = df[
+            df['content'].notna() &  # 保留非空内容
+            (~df['content'].str.contains('再就业男团', na=False))  # 过滤指定内容
+            ]
+        df = df.drop_duplicates(subset=['content'])  # 去重
+
+        # 保持日期格式
+        try:
+            df['time'] = pd.to_datetime(df['time'], errors='coerce').dt.strftime('%Y-%m-%d')
+        except:
+            df['time'] = df['time'].astype(str)
+
+        filename = f"{KEYWORDS}_微博数据_{datetime.datetime.now().strftime('%Y%m%d%H%M')}.xlsx"
+        df.to_excel(filename, index=False, engine='openpyxl')
+        print(f"\n数据已保存至 {filename}")
+
+
+if __name__ == '__main__':
+    scraper = WeiboScraper()
+    scraper.scrape()
