@@ -1,0 +1,180 @@
+from DrissionPage import WebPage
+from DataRecorder import Recorder
+from tqdm import tqdm
+import time
+import random
+from datetime import datetime, date
+from bs4 import BeautifulSoup
+import pandas as pd
+
+
+def validate_url(url):
+    """验证URL格式是否合法"""
+    return url.startswith(('http://', 'https://'))
+
+
+def sign_in():
+    flag = True
+    sign_in_page = WebPage()
+    while True:
+        sign_in_page.get('https://www.xiaohongshu.com')
+        sign_in_page.set.window.max()
+        time.sleep(3)
+        search_placeholder = sign_in_page.active_ele.html
+        if '输入手机号' in search_placeholder:
+            if flag:
+                print("请扫码登录#")
+                flag = False
+            else:
+                time.sleep(20)
+        else:
+            print("登录成功！")
+            sign_in_page.change_mode()
+            break
+
+
+def record_error_link_to_txt(link, error_type='page_missing'):
+    with open('error_links.txt', 'a') as file:
+        file.write(f"{error_type}: {link}\n")
+    print(f'【错误记录】{error_type}: {link}')
+
+
+def open_url(url):
+    global page
+    if not validate_url(url):  # 关键修复：URL格式验证
+        raise ValueError(f"Invalid URL: {url}")
+
+    page = WebPage('s')
+    try:
+        page.get(url)
+        if page.title == '滑块验证':
+            page.change_mode()
+            page.get(url)
+            print('请手动处理验证码')
+        elif '你访问的页面不见了' in page.title:
+            record_error_link_to_txt(url, 'page_not_found')
+            return False
+        return True
+    except Exception as e:
+        record_error_link_to_txt(url, f'other_error({str(e)})')
+        return False
+
+
+def get_author_info(page):
+    try:
+        div_author = page.ele('.author-container', timeout=2)
+        div_info = div_author.ele('.info', timeout=2)
+        author_name = div_info.ele('.username', timeout=2).text
+        author_link = div_info.eles('tag:a')[0].link.split("?")[0]
+        return {'author_name': author_name, 'author_link': author_link}
+    except Exception as e:
+        print(f"获取作者信息失败: {str(e)}")
+        return {'author_name': '', 'author_link': ''}
+
+
+def get_note_content(page):
+    content = {'note_warning_tip': '', 'note_title': '', 'note_desc': '', 'tags': [], 'note_date': ''}
+    try:
+        note_container = page.ele('.note-container', timeout=2)
+        content['note_warning_tip'] = note_container.ele('.note-warning-tip', timeout=0).text
+    except:
+        pass
+
+    try:
+        note_content = page.ele('.note-content', timeout=2)
+        content['note_title'] = note_content.ele('.title', timeout=0).text
+        content['note_desc'] = note_content.ele('.desc', timeout=0).text
+        content['tags'] = [tag.texts()[0] for tag in note_content.eles('.tag', timeout=0)]
+
+        date_str = note_content.ele('.bottom-container', timeout=0).text
+        if "编辑于" in date_str:
+            date_str = date_str.split(" ")[1]
+        if date_str.count('-') == 1:
+            date_str = f"{datetime.now().year}-{date_str}"
+        content['note_date'] = date_str
+    except Exception as e:
+        print(f"获取内容失败: {str(e)}")
+    return content
+
+
+def get_count(page):
+    try:
+        html = page.html
+        soup = BeautifulSoup(html, 'html.parser')
+        return {
+            'like_count': soup.find('meta', attrs={'name': 'og:xhs:note_like'})['content'],
+            'collect_count': soup.find('meta', attrs={'name': 'og:xhs:note_collect'})['content'],
+            'chat_count': soup.find('meta', attrs={'name': 'og:xhs:note_comment'})['content']
+        }
+    except Exception as e:
+        print(f"获取统计信息失败: {str(e)}")
+        return {'like_count': '0', 'collect_count': '0', 'chat_count': '0'}
+
+
+def get_note_page_info(url):
+    if not validate_url(url):  # 前置校验
+        print(f"跳过无效URL: {url}")
+        return
+
+    try:
+        if not open_url(url):
+            return
+
+        author_info = get_author_info(page)
+        content = get_note_content(page)
+        count = get_count(page)
+
+        note_info_dict = {
+            '采集日期': date.today(),
+            '作者': author_info['author_name'],
+            '笔记标题': content['note_title'],
+            '发布日期': content['note_date'],
+            '点赞数': count['like_count'],
+            '收藏数': count['collect_count'],
+            '评论数': count['chat_count'],
+            '提示': content['note_warning_tip'],
+            '笔记链接': url,
+            '作者链接': author_info['author_link'],
+            '标签': content['tags'],
+            '笔记内容': content['note_desc']
+        }
+
+        print(f"【采集成功】{url}")
+        r.add_data(note_info_dict)
+    except Exception as e:
+        print(f"处理失败: {url} - {str(e)}")
+        record_error_link_to_txt(url, f'process_error({str(e)})')
+    finally:
+        time.sleep(random.uniform(1, 2))
+
+
+def read_urls_from_txt(path):
+    with open(path, 'r') as file:
+        return [line.strip() for line in file if line.strip() and validate_url(line.strip())]  # 关键修复：读取时过滤
+
+
+if __name__ == '__main__':
+    sign_in()
+
+    current_time = time.strftime("%Y-%m-%d %H%M%S")
+    note_info_excel_path = f'小红书笔记详情{current_time}.xlsx'
+    r = Recorder(path=note_info_excel_path, cache_size=1)
+
+    note_urls_file_path = r"C:\Users\Lenovo\Desktop\URL.txt"
+    note_urls = read_urls_from_txt(note_urls_file_path)
+    print(f'有效URL数量: {len(note_urls)}')
+
+    for url in tqdm(note_urls, desc="采集进度"):
+        get_note_page_info(url)
+
+    r.record()
+
+    # 去重处理
+    try:
+        df = pd.read_excel(note_info_excel_path, engine='openpyxl')
+        df.drop_duplicates(subset=['笔记链接'], inplace=True)
+        df.to_excel(note_info_excel_path, index=False, engine='openpyxl')
+        print("去重完成")
+    except Exception as e:
+        print(f"去重失败: {str(e)}")
+
