@@ -1,0 +1,343 @@
+from DrissionPage import WebPage
+from DataRecorder import Recorder
+from tqdm import tqdm
+import time
+import random
+from datetime import datetime, date, timedelta
+from bs4 import BeautifulSoup
+import pandas as pd
+import re
+from pymongo import MongoClient
+from pymongo.errors import BulkWriteError, DuplicateKeyError
+
+# ------------------------- MongoDB配置 -------------------------
+MONGO_URI = "mongodb://localhost:27017/"
+DATABASE_NAME = "xiaohongshu"
+SEARCH_COLLECTION = "search_results"  # 搜索结果的集合
+DETAIL_COLLECTION = "note_details"  # 详情数据的集合
+
+
+def get_mongodb_collection(collection_name):
+    """通用获取MongoDB集合方法"""
+    try:
+        client = MongoClient(MONGO_URI)
+        db = client[DATABASE_NAME]
+        return db[collection_name]
+    except Exception as e:
+        print(f"MongoDB连接失败：{str(e)}")
+        return None
+
+
+def get_search_result_urls():
+    """从search_results集合获取所有笔记链接"""
+    collection = get_mongodb_collection(SEARCH_COLLECTION)
+    if collection is None:
+        return []
+
+    try:
+        # 去重查询所有有效的笔记链接
+        results = collection.find(
+            {"笔记链接": {"$exists": True}},
+            {"_id": 0, "笔记链接": 1}
+        )
+        return list(set([result["笔记链接"] for result in results if validate_url(result["笔记链接"])]))
+
+    except Exception as e:
+        print(f"查询搜索集合失败：{str(e)}")
+        return []
+
+
+def connect_detail_collection():
+    """连接详情存储集合并确保索引"""
+    collection = get_mongodb_collection(DETAIL_COLLECTION)
+    if collection is None:
+        return None
+
+    try:
+        # 清理旧索引并创建新索引
+        existing_indexes = collection.index_information()
+        target_field = "笔记链接"
+        new_index_name = "note_url_unique_index"
+
+        # 清理旧索引
+        old_indexes = [name for name, idx in existing_indexes.items()
+                       if idx['key'][0][0] == target_field and name != new_index_name]
+        for old_name in old_indexes:
+            collection.drop_index(old_name)
+
+        # 创建新索引
+        if new_index_name not in existing_indexes:
+            collection.create_index([(target_field, 1)],
+                                    unique=True,
+                                    name=new_index_name)
+
+        return collection
+
+    except Exception as e:
+        print(f"索引处理失败：{str(e)}")
+        return collection
+
+
+def save_to_mongodb(data_list):
+    """批量存储数据到详情集合"""
+    if not data_list:
+        return
+
+    collection = connect_detail_collection()
+    if collection is None:
+        print("详情集合连接失败，跳过存储")
+        return
+
+    try:
+        # 数据预处理
+        processed_data = []
+        for data in data_list:
+            # 转换日期类型
+            if isinstance(data['采集日期'], date):
+                data['采集日期'] = datetime.combine(data['采集日期'], datetime.min.time())
+            # 转换标签为字符串
+            data['标签'] = [str(tag) for tag in data['标签']]
+            processed_data.append(data)
+
+        # 批量插入（忽略重复数据）
+        try:
+            result = collection.insert_many(processed_data, ordered=False)
+            print(f"成功插入 {len(result.inserted_ids)} 条新数据")
+        except BulkWriteError as e:
+            inserted = e.details['nInserted']
+            errors = len(e.details['writeErrors'])
+            print(f"跳过 {errors} 条重复数据，MongoDB成功插入 {inserted} 条新数据")
+
+    except Exception as e:
+        print(f"数据存储异常：{type(e).__name__} - {str(e)}")
+
+
+# ------------------------- 原有功能函数 -------------------------
+def validate_url(url):
+    """验证URL格式是否合法"""
+    return url.startswith(('http://', 'https://'))
+
+
+def sign_in():
+    flag = True
+    sign_in_page = WebPage()
+    while True:
+        sign_in_page.get('https://www.xiaohongshu.com')
+        sign_in_page.set.window.max()
+        time.sleep(3)
+        search_placeholder = sign_in_page.active_ele.html
+        if '输入手机号' in search_placeholder:
+            if flag:
+                print("请扫码登录#")
+                flag = False
+            else:
+                time.sleep(20)
+        else:
+            print("登录成功！")
+            sign_in_page.change_mode()
+            break
+
+
+def record_error_link_to_txt(link, error_type='page_missing'):
+    with open('error_links.txt', 'a') as file:
+        file.write(f"{error_type}: {link}\n")
+    print(f'【错误记录】{error_type}: {link}')
+
+
+def open_url(url):
+    global page
+    if not validate_url(url):
+        raise ValueError(f"Invalid URL: {url}")
+
+    page = WebPage('s')
+    try:
+        page.get(url)
+        if page.title == '滑块验证':
+            page.change_mode()
+            page.get(url)
+            print('请手动处理验证码')
+        elif '你访问的页面不见了' in page.title:
+            record_error_link_to_txt(url, 'page_not_found')
+            return False
+        return True
+    except Exception as e:
+        record_error_link_to_txt(url, f'other_error({str(e)})')
+        return False
+
+
+def get_author_info(page):
+    try:
+        div_author = page.ele('.author-container', timeout=2)
+        div_info = div_author.ele('.info', timeout=2)
+        author_name = div_info.ele('.username', timeout=2).text
+        author_link = div_info.eles('tag:a')[0].link.split("?")[0]
+        return {'author_name': author_name, 'author_link': author_link}
+    except Exception as e:
+        print(f"获取作者信息失败: {str(e)}")
+        return {'author_name': '', 'author_link': ''}
+
+
+def parse_xhs_time(date_str):
+    """将小红书时间格式转换为标准日期"""
+    today = datetime.now()
+    date_str = date_str.strip()
+
+    # 处理IP属地
+    ip_match = re.search(r'([\u4e00-\u9fa5]{2,})$', date_str)
+    if ip_match:
+        ip_location = ip_match.group()
+        date_str = date_str.replace(ip_location, '').strip()
+    else:
+        ip_location = ''
+
+    # 解析时间
+    if '昨天' in date_str:
+        date_obj = today - timedelta(days=1)
+        time_part = re.search(r'\d{1,2}:\d{2}', date_str).group()
+        hour, minute = map(int, time_part.split(':'))
+        return date_obj.replace(hour=hour, minute=minute), ip_location
+    elif '小时前' in date_str:
+        hours_ago = int(re.search(r'\d+', date_str).group())
+        return today - timedelta(hours=hours_ago), ip_location
+    else:
+        try:
+            return datetime.strptime(date_str, '%Y-%m-%d %H:%M'), ip_location
+        except:
+            try:
+                return datetime.strptime(date_str, '%Y-%m-%d'), ip_location
+            except:
+                return None, ip_location
+
+
+def get_note_content(page):
+    content = {
+        'note_warning_tip': '',
+        'note_title': '',
+        'note_desc': '',
+        'tags': [],
+        'note_date': None,
+        'ip_location': ''
+    }
+
+    try:
+        note_container = page.ele('.note-container', timeout=2)
+        content['note_warning_tip'] = note_container.ele('.note-warning-tip', timeout=0).text
+    except:
+        pass
+
+    try:
+        note_content = page.ele('.note-content', timeout=2)
+        content['note_title'] = note_content.ele('.title', timeout=0).text
+        content['note_desc'] = note_content.ele('.desc', timeout=0).text
+        content['tags'] = [tag.texts()[0] for tag in note_content.eles('.tag', timeout=0)]
+
+        raw_date_str = note_content.ele('.bottom-container', timeout=0).text
+        parsed_date, ip_location = parse_xhs_time(raw_date_str)
+        content['note_date'] = parsed_date
+        content['ip_location'] = ip_location
+
+    except Exception as e:
+        print(f"获取内容失败: {str(e)}")
+    return content
+
+
+def get_count(page):
+    try:
+        html = page.html
+        soup = BeautifulSoup(html, 'html.parser')
+        return {
+            'like_count': soup.find('meta', attrs={'name': 'og:xhs:note_like'})['content'],
+            'collect_count': soup.find('meta', attrs={'name': 'og:xhs:note_collect'})['content'],
+            'chat_count': soup.find('meta', attrs={'name': 'og:xhs:note_comment'})['content']
+        }
+    except Exception as e:
+        print(f"获取统计信息失败: {str(e)}")
+        return {'like_count': '0', 'collect_count': '0', 'chat_count': '0'}
+
+
+def get_note_page_info(url, data_buffer):
+    if not validate_url(url):
+        print(f"跳过无效URL: {url}")
+        return
+
+    try:
+        if not open_url(url):
+            return
+
+        author_info = get_author_info(page)
+        content = get_note_content(page)
+        count = get_count(page)
+
+        note_info = {
+            '采集日期': date.today(),
+            '作者': author_info['author_name'],
+            '笔记标题': content['note_title'],
+            '发布日期': content['note_date'],
+            '点赞数': count['like_count'],
+            '收藏数': count['collect_count'],
+            '评论数': count['chat_count'],
+            'IP属地': content['ip_location'],
+            '提示': content['note_warning_tip'],
+            '笔记链接': url,
+            '作者链接': author_info['author_link'],
+            '标签': content['tags'],
+            '笔记内容': content['note_desc']
+        }
+
+        print(f"【采集成功】{url}")
+        data_buffer.append(note_info)
+
+    except Exception as e:
+        print(f"处理失败: {url} - {str(e)}")
+        record_error_link_to_txt(url, f'process_error({str(e)})')
+    finally:
+        time.sleep(random.uniform(1, 2))
+
+
+if __name__ == '__main__':
+    sign_in()
+
+    # 初始化数据记录
+    current_time = time.strftime("%Y-%m-%d %H%M%S")
+    note_info_excel_path = f'小红书笔记详情{current_time}.xlsx'
+    r = Recorder(path=note_info_excel_path, cache_size=10)
+
+    # 从MongoDB获取待采集URL
+    note_urls = get_search_result_urls()
+    print(f'从MongoDB获取有效URL数量: {len(note_urls)}')
+
+    # 数据采集缓冲区
+    data_buffer = []
+    batch_size = 20
+
+    # 执行采集
+    for i, url in enumerate(tqdm(note_urls, desc="采集进度")):
+        get_note_page_info(url, data_buffer)
+
+        # 批量保存
+        if (i + 1) % batch_size == 0 or (i + 1) == len(note_urls):
+            # 保存到Excel
+            if data_buffer:
+                r.add_data(data_buffer)
+                r.record()
+
+            # 保存到MongoDB
+            save_to_mongodb(data_buffer)
+
+            # 清空缓冲区
+            data_buffer.clear()
+
+    # 最终保存
+    if data_buffer:
+        r.add_data(data_buffer)
+        r.record()
+        save_to_mongodb(data_buffer)
+
+    # Excel去重处理
+    try:
+        df = pd.read_excel(note_info_excel_path, engine='openpyxl')
+        df = df.drop_duplicates(subset=['笔记链接'])
+        df.to_excel(note_info_excel_path, index=False, engine='openpyxl')
+        print(f"Excel文件已保存：{note_info_excel_path}")
+    except Exception as e:
+        print(f"Excel处理失败：{str(e)}")
