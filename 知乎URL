@@ -1,0 +1,138 @@
+from DrissionPage import ChromiumPage
+import pandas as pd
+from tqdm import tqdm
+import time
+from urllib.parse import quote
+import random
+import openpyxl
+
+
+def sign_in():
+    page = ChromiumPage()
+    page.set.window.max()
+    page.get('https://www.zhihu.com')
+    time.sleep(3)
+
+    # 检查登录状态
+    if page.ele('text=登录'):
+        print("请手动登录知乎...")
+        while True:
+            if not page.ele('text=登录'):
+                print("登录成功！")
+                break
+            time.sleep(5)
+    else:
+        print("检测到已登录状态")
+
+
+def search(keyword):
+    global page
+    page = ChromiumPage()
+    encoded_keyword = quote(keyword)
+    search_url = f'https://www.zhihu.com/search?q={encoded_keyword}&type=content'
+    page.get(search_url)
+    time.sleep(5)
+
+    # 关闭可能的弹窗
+    for _ in range(3):
+        if close_btn := page.ele('css:.Modal-closeButton'):
+            close_btn.click()
+            time.sleep(1)
+
+
+def select_sort_method(sort_method):
+    time.sleep(2)
+    if sort_method == "最新":
+        sort_btn = page.ele('css:.SortMenu button')
+        if sort_btn:
+            sort_btn.click()
+            time.sleep(1)
+            latest_opt = page.ele('text=时间排序')
+            if latest_opt:
+                latest_opt.click()
+                time.sleep(3)
+
+
+def get_info():
+    print(f"第{i}次爬取")
+    items = page.eles('css:.List-item') or page.eles('css:.AnswerItem')
+
+    for item in items:
+        try:
+            # 提取标题和链接
+            title_elem = item.ele('css:h2.ContentItem-title a')
+            if not title_elem:
+                title_elem = item.ele('css:.ContentItem-title a')
+
+            if title_elem:
+                title = title_elem.text.strip()
+                link = title_elem.link
+                contents.append([title, link])
+                print(f"标题：{title[:40]}... | 链接：{link}")
+            else:
+                continue  # 跳过没有标题的项
+        except Exception as e:
+            continue
+
+
+def page_scroll_down():
+    # 知乎需要更大幅度的滚动
+    page.scroll.down(2500)
+    time.sleep(random.uniform(1.5, 3))
+
+
+def crawler(times):
+    global i
+    for i in tqdm(range(1, times + 1)):
+        get_info()
+        page_scroll_down()
+
+
+def save_to_excel(data):
+    if not data:
+        print("没有获取到有效数据")
+        return
+
+    df = pd.DataFrame(data, columns=['标题', '文章链接'])
+
+    # 数据清洗
+    df = df[df['文章链接'].str.startswith('https://')]
+    df = df.drop_duplicates(subset=['文章链接'])
+
+    if df.empty:
+        print("没有有效数据需要保存！")
+        return
+
+    current_time = time.strftime("%Y-%m-%d %H%M%S")
+
+
+    # 生成文件名
+    excel_path = f"知乎搜索结果-{keyword}--{current_time}--{df.shape[0]}条.xlsx"
+
+    # 保存数据
+    df.to_excel(excel_path, index=False)
+
+    # 设置列宽
+    wb = openpyxl.load_workbook(excel_path)
+    ws = wb.active
+    ws.column_dimensions['A'].width = 80  # 标题列
+    ws.column_dimensions['B'].width = 50  # 链接列
+    wb.save(excel_path)
+
+    print(f"数据已保存至：{excel_path}")
+
+
+if __name__ == '__main__':
+    # 配置参数
+    keyword = "求职"
+    sort_method = "综合"  # 可选 "综合" 或 "最新"
+    times = 10# 滚动次数
+
+    contents = []
+
+    # 执行流程
+    sign_in()
+    search(keyword)
+    select_sort_method(sort_method)
+    crawler(times)
+    save_to_excel(contents)
